@@ -12,7 +12,11 @@ Watches Alsa system midi events through System:Announce, and will maintain any p
 
     Options:
 	    --once	Don't persist: run connections once and exit; do not listen for events.
-
+	    
 
 ## Requirements
 -libasound
+
+## See Also
+- [Div's MIDI Utilities](https://github.com/dgslomin/divs-midi-utilities) / alsamidicable
+- [naconnect](https://github.com/nedko/naconnect) - an ncurses-based ALSA MIDI sequencer connection manager
