@@ -1,6 +1,7 @@
 using namespace std;
 
 #include <string>
+#include <list>
 #include <vector>
 #include <map>
 #include <utility>
@@ -10,21 +11,13 @@ using namespace std;
 
 #include <alsa/asoundlib.h>
 
-//Alsa midi client id and port id are unsigned char...
-typedef uint8_t seq_id;
+//Alsa midi client id and port id are unsigned char
+typedef unsigned char seq_id;
+enum ID_Status { ID_UNSET=0, ID_DISCOVERED, ID_USER_SET };
 
 
-struct user_connection
-{
-  string source_client_name;
-  string source_port_name;
-  string dest_client_name;
-  string dest_port_name;
-
-  //TODO: Support specifying id number in addition to text name
-};
-
-vector<user_connection> conn_configs;
+class user_connection;
+list<user_connection> conn_configs;
 
 //Map for client name to id
 map<string, seq_id> client_map;
@@ -35,7 +28,92 @@ map<pair<seq_id,string>, seq_id> port_map;
 //Map for alsa subscriptions
 map<pair<seq_id,seq_id>, pair<seq_id,seq_id>> sub_map;
 
+//Map id's to names
+map<pair<seq_id,seq_id>, pair<string,string>> id_map;
 
+
+struct midi_addr {
+  string name;
+  seq_id id;
+  ID_Status status;
+};
+
+class user_connection
+{
+  protected:
+    enum Addr_Type { SRC_CLIENT=0, SRC_PORT=1, DST_CLIENT=2, DST_PORT=3 };
+    midi_addr addr[4];
+
+    bool manually_disconnected; //Port unsubscribe
+
+  public:
+    //These are dangerous?  Prob should write copy/move constructor or getters
+    //For now we'll make sure conn_configs is the only owner/creator
+    const midi_addr &src_client = addr[SRC_CLIENT];
+    const midi_addr &src_port = addr[SRC_PORT];
+    const midi_addr &dst_client = addr[DST_CLIENT];
+    const midi_addr &dst_port = addr[DST_PORT];
+
+    bool all_ids_valid;
+    bool is_connected;
+
+  public:
+    user_connection(string src_client, string src_port, string dst_client, string dst_port)
+    {
+      addr[SRC_CLIENT] = { .name=src_client, .status=ID_UNSET };
+      addr[SRC_PORT] = { .name=src_port, .status=ID_UNSET };
+      addr[DST_CLIENT] = { .name=dst_client, .status=ID_UNSET };
+      addr[DST_PORT] = { .name=dst_port, .status=ID_UNSET };
+    }
+
+    // Sets midi id and status based on our maps of alsa graph
+    void set_ids(midi_addr &client, midi_addr &port) {
+      // Handle client lookups
+      if (client.status != ID_USER_SET) {
+        auto client_it = client_map.find(client.name);
+        if (client_it == client_map.end()) {
+          client.status = ID_UNSET;
+        }
+        else {
+          client.id = client_it->second;
+          client.status = ID_DISCOVERED;
+        }
+      }
+      // Handle port lookups
+      if (port.status != ID_USER_SET && client.status != ID_UNSET) {
+        auto port_it = port_map.find(make_pair(client.id, port.name));
+        if (port_it == port_map.end()) {
+          port.status = ID_UNSET;
+        }
+        else {
+          port.id = port_it->second;
+          port.status = ID_DISCOVERED;
+        }
+      }
+    }
+
+    void update_state() {
+      set_ids(this->addr[SRC_CLIENT], this->addr[SRC_PORT]);
+      set_ids(this->addr[DST_CLIENT], this->addr[DST_PORT]);
+
+      // Some boolean logic: AND statuses together
+      bool s = true;
+      for (int i=0; i<4; ++i) {
+        s = s && (this->addr[i].status != ID_UNSET);
+      }
+      this->all_ids_valid = s;
+
+      if (this->all_ids_valid) {
+        auto it = sub_map.find(make_pair(this->addr[SRC_CLIENT].id, this->addr[SRC_PORT].id));
+        if (it == sub_map.end())
+          this->is_connected = false;
+        else {
+          auto connected_dst = it->second;
+          this->is_connected = (connected_dst.first == this->addr[DST_CLIENT].id && connected_dst.second == this->addr[DST_PORT].id);
+        }
+      }
+    }
+};
 
 snd_seq_t* sequencer_open()
 {
@@ -77,20 +155,24 @@ void alsa_build_graph(snd_seq_t *sequencer)
   while (snd_seq_query_next_client(sequencer, client_info) >= 0)
   {
     seq_id client_id = snd_seq_client_info_get_client(client_info);
+    const string client_name = string(snd_seq_client_info_get_name(client_info));
     snd_seq_port_info_set_client(port_info, client_id);
     snd_seq_port_info_set_port(port_info, -1);
 
     //Map client name to id
-    client_map[string(snd_seq_client_info_get_name(client_info))] = client_id;
+    client_map[client_name] = client_id;
 
     //Iterate over ports for this client
     while (snd_seq_query_next_port(sequencer, port_info) >= 0)
     {
-      const char *port_name = snd_seq_port_info_get_name(port_info);
+      const string port_name = string(snd_seq_port_info_get_name(port_info));
       const seq_id port_id = snd_seq_port_info_get_port(port_info);
 
       //Map port name to id
-      port_map[make_pair(client_id,string(port_name))] = port_id;
+      port_map[make_pair(client_id,port_name)] = port_id;
+
+      //Map id's to names
+      id_map[make_pair(client_id,port_id)] = make_pair(client_name,port_name);
 
       //If we are an input(read)-capable port, check for subscriptions
       if (snd_seq_port_info_get_capability(port_info) & SND_SEQ_PORT_CAP_SUBS_READ)
@@ -122,35 +204,6 @@ void alsa_build_graph(snd_seq_t *sequencer)
   snd_seq_client_info_free(client_info);
 }
 
-// Lookup a client:port name, and if found place its id's in target
-bool lookup_name(pair<seq_id,seq_id> &target, const string client, const string port)
-{
-  auto client_it = client_map.find(client);
-  if (client_it == client_map.end())
-    return false;
-
-  seq_id client_id = client_it->second;
-
-  auto port_it = port_map.find(make_pair(client_id, port));
-  if (port_it == port_map.end())
-    return false;
-
-  target.first = client_id;
-  target.second = port_it->second;
-
-  return true;
-}
-
-bool is_connected(const pair<seq_id,seq_id> &source, const pair<seq_id,seq_id> &dest)
-{
-  auto it = sub_map.find(source);
-  if (it == sub_map.end())
-    return false;
-
-  auto connected_dst = it->second;
-  return (connected_dst.first == dest.first && connected_dst.second == dest.second);
-}
-
 // Connect sender client:port to dest client:port
 bool alsa_connect(snd_seq_t* sequencer, const pair<seq_id,seq_id> &sender, const pair<seq_id,seq_id> &dest)
 {
@@ -174,23 +227,28 @@ bool alsa_connect(snd_seq_t* sequencer, const pair<seq_id,seq_id> &sender, const
   return (!r);
 }
 
+
+
+
+
+
+
 void run_connections(snd_seq_t* sequencer)
 {
-  // Loop through connection config, make the connection if the ports are online and not already connected
-  pair<seq_id,seq_id> confsrc, confdst;
-  for (auto const& c : conn_configs) {
-    bool ids_found = lookup_name(confsrc, c.source_client_name, c.source_port_name) && lookup_name(confdst, c.dest_client_name, c.dest_port_name);
+  for (auto &c : conn_configs) {
+    c.update_state();
+    if (c.is_connected) continue;
 
-    if (!ids_found) continue;
-    if (is_connected(confsrc, confdst)) continue;
-
-    if (alsa_connect(sequencer, confsrc, confdst))
-      //std::format is c++20?  A bit too new...
+    if (alsa_connect(sequencer, make_pair(c.src_client.id,c.src_port.id), make_pair(c.dst_client.id,c.dst_port.id))) {
       printf("Connected %s:%s (%d:%d) to %s:%s (%d:%d)\n", 
-        c.source_client_name.c_str(), c.source_port_name.c_str(), confsrc.first, confsrc.second,
-        c.dest_client_name.c_str(), c.dest_port_name.c_str(), confdst.first, confdst.second);
+        c.src_client.name.c_str(), c.src_port.name.c_str(), c.src_client.id, c.src_port.id,
+        c.dst_client.name.c_str(), c.dst_port.name.c_str(), c.dst_client.id, c.dst_port.id);
+    }
   }
 }
+
+
+
 
 
 
@@ -240,11 +298,19 @@ void parse_config(ifstream &infile)
       continue;
     }
 
-    user_connection c = { cols[0], cols[1], cols[2], cols[3] };
-    conn_configs.push_back(c);
+    conn_configs.emplace_back(cols[0], cols[1], cols[2], cols[3]);
   }
 
   cout << conn_configs.size() << " connection request(s) loaded" << endl;
+}
+
+
+void dump() {
+  auto seq = sequencer_open();
+  alsa_build_graph(seq);
+  sequencer_close(seq);
+
+  //TODO
 }
 
 
@@ -274,6 +340,11 @@ int main(int argc, char **argv)
 		}
     else if (strcmp(argv[i], "--once") == 0)
       runonce = true;
+    else if (strcmp(argv[i], "--dump") == 0)
+      dump();
+    else if (strcmp(argv[i], "--lax") == 0)
+      //TODO: lax mode - don't reconnect manually disconnected items, only if port re-created
+      ;
     else if (strcmp(argv[i], "--help") == 0)
       usage(argv[0]);
 		else
@@ -323,10 +394,16 @@ int main(int argc, char **argv)
     switch(ev->type)
     {
       //Too lazy to implement individual state changes (for now).  Lets just wait a second and re-build.
+      case SND_SEQ_EVENT_PORT_UNSUBSCRIBED:
+        //TODO: Lax mode
+        //find our port and update manually disconnected
+
       case SND_SEQ_EVENT_CLIENT_CHANGE:
       case SND_SEQ_EVENT_PORT_START:
-      case SND_SEQ_EVENT_PORT_UNSUBSCRIBED:
       case SND_SEQ_EVENT_PORT_CHANGE:
+        //TODO: Lax mode
+        //loop find manually disconnected ports, if match, disabled manually disconnected mode
+
         cout << "Alsa midi layout change detected.  Refreshing connections." << endl;
         sleep(1);
         snd_seq_drop_input(seq);
@@ -337,7 +414,11 @@ int main(int argc, char **argv)
       case SND_SEQ_EVENT_CLIENT_START:
       case SND_SEQ_EVENT_CLIENT_EXIT:
       case SND_SEQ_EVENT_PORT_EXIT:
+        //TODO: Lax mode
+        //find manually disconnected ports, if match, disabled manually disconnected mode
       case SND_SEQ_EVENT_PORT_SUBSCRIBED:
+        //TODO: Lax mode
+        //find manually disconnected ports, if match, disabled manually disconnected mode
       default:
         break;
     }
@@ -349,3 +430,8 @@ int main(int argc, char **argv)
   sequencer_close(seq);
   return 0;
 }
+
+
+
+
+
