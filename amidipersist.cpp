@@ -310,7 +310,15 @@ void dump() {
   alsa_build_graph(seq);
   sequencer_close(seq);
 
-  //TODO
+  for (auto const &c : sub_map) {
+    auto src = c.first;
+    auto dst = c.second;
+
+    printf("%s:%s",    id_map.at(src).first.c_str(), id_map.at(src).second.c_str());
+    printf(":%s:%s\n", id_map.at(dst).first.c_str(), id_map.at(dst).second.c_str());
+  }
+
+  exit(0);
 }
 
 
@@ -323,6 +331,7 @@ void usage(char *program_name)
   fprintf(stderr, "\t\tEmpty lines and lines beginning with # are ignored\n");
   fprintf(stderr, "\nOptions:\n");
   fprintf(stderr, "\t--once\tDon't persist: run connections once and exit; do not listen for events.\n");
+  fprintf(stderr, "\t--dump\tDump names of current alsa subscriptions and exit.\n");
   exit(1);
 }
 
