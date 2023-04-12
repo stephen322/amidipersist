@@ -26,7 +26,7 @@ map<string, seq_id> client_map;
 map<pair<seq_id,string>, seq_id> port_map;
 
 //Map for alsa subscriptions
-map<pair<seq_id,seq_id>, pair<seq_id,seq_id>> sub_map;
+multimap<pair<seq_id,seq_id>, pair<seq_id,seq_id>> sub_map;
 
 //Map id's to names
 map<pair<seq_id,seq_id>, pair<string,string>> id_map;
@@ -104,12 +104,14 @@ class user_connection
       this->all_ids_valid = s;
 
       if (this->all_ids_valid) {
-        auto it = sub_map.find(make_pair(this->addr[SRC_CLIENT].id, this->addr[SRC_PORT].id));
-        if (it == sub_map.end())
-          this->is_connected = false;
-        else {
+        this->is_connected = false;
+        auto range = sub_map.equal_range(make_pair(this->addr[SRC_CLIENT].id, this->addr[SRC_PORT].id));
+        for (auto it = range.first; it != range.second; ++it) {
           auto connected_dst = it->second;
-          this->is_connected = (connected_dst.first == this->addr[DST_CLIENT].id && connected_dst.second == this->addr[DST_PORT].id);
+          if (connected_dst.first == this->addr[DST_CLIENT].id && connected_dst.second == this->addr[DST_PORT].id) {
+            this->is_connected = true;
+            break;
+          }
         }
       }
     }
@@ -189,7 +191,10 @@ void alsa_build_graph(snd_seq_t *sequencer)
           snd_seq_get_any_client_info(sequencer, snd_seq_port_info_get_client(connected_port_info), connected_client_info);
 
           //Map subscription
-          sub_map[make_pair(client_id, port_id)] = make_pair(snd_seq_client_info_get_client(connected_client_info), snd_seq_port_info_get_port(connected_port_info));
+          sub_map.emplace(make_pair(
+            make_pair(client_id, port_id),
+            make_pair(snd_seq_client_info_get_client(connected_client_info), snd_seq_port_info_get_port(connected_port_info))
+          ));
 
           snd_seq_query_subscribe_set_index(subscriptions, snd_seq_query_subscribe_get_index(subscriptions) + 1);
         }
@@ -309,6 +314,8 @@ void dump() {
   auto seq = sequencer_open();
   alsa_build_graph(seq);
   sequencer_close(seq);
+
+  cerr << sub_map.size() << " connections:" << endl;
 
   for (auto const &c : sub_map) {
     auto src = c.first;
