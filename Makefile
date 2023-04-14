@@ -1,5 +1,5 @@
-amidipersist: amidipersist.cpp
-	g++ -o amidipersist -g3 amidipersist.cpp -lasound
+amidipersist: amidipersist.cpp UserConnection.cpp
+	g++ -o amidipersist -g3 amidipersist.cpp UserConnection.cpp -lasound
 
 install: amidipersist
 	strip amidipersist

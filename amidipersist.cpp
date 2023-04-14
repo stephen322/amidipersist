@@ -2,6 +2,7 @@ using namespace std;
 
 #include <string>
 #include <list>
+#include <set>
 #include <vector>
 #include <map>
 #include <utility>
@@ -11,111 +12,14 @@ using namespace std;
 
 #include <alsa/asoundlib.h>
 
-//Alsa midi client id and port id are unsigned char
-typedef unsigned char seq_id;
-enum ID_Status { ID_UNSET=0, ID_DISCOVERED, ID_USER_SET };
+#include "common.h"
+#include "UserConnection.h"
 
 
-class user_connection;
-list<user_connection> conn_configs;
+// Globals
+list<UserConnection> conn_configs;
+struct alsa_state alsa_state;
 
-//Map for client name to id
-map<string, seq_id> client_map;
-
-//Map for port name (plus client id) to port id
-map<pair<seq_id,string>, seq_id> port_map;
-
-//Map for alsa subscriptions
-multimap<pair<seq_id,seq_id>, pair<seq_id,seq_id>> sub_map;
-
-//Map id's to names
-map<pair<seq_id,seq_id>, pair<string,string>> id_map;
-
-
-struct midi_addr {
-  string name;
-  seq_id id;
-  ID_Status status;
-};
-
-class user_connection
-{
-  protected:
-    enum Addr_Type { SRC_CLIENT=0, SRC_PORT=1, DST_CLIENT=2, DST_PORT=3 };
-    midi_addr addr[4];
-
-    bool manually_disconnected; //Port unsubscribe
-
-  public:
-    //These are dangerous?  Prob should write copy/move constructor or getters
-    //For now we'll make sure conn_configs is the only owner/creator
-    const midi_addr &src_client = addr[SRC_CLIENT];
-    const midi_addr &src_port = addr[SRC_PORT];
-    const midi_addr &dst_client = addr[DST_CLIENT];
-    const midi_addr &dst_port = addr[DST_PORT];
-
-    bool all_ids_valid;
-    bool is_connected;
-
-  public:
-    user_connection(string src_client, string src_port, string dst_client, string dst_port)
-    {
-      addr[SRC_CLIENT] = { .name=src_client, .status=ID_UNSET };
-      addr[SRC_PORT] = { .name=src_port, .status=ID_UNSET };
-      addr[DST_CLIENT] = { .name=dst_client, .status=ID_UNSET };
-      addr[DST_PORT] = { .name=dst_port, .status=ID_UNSET };
-    }
-
-    // Sets midi id and status based on our maps of alsa graph
-    void set_ids(midi_addr &client, midi_addr &port) {
-      // Handle client lookups
-      if (client.status != ID_USER_SET) {
-        auto client_it = client_map.find(client.name);
-        if (client_it == client_map.end()) {
-          client.status = ID_UNSET;
-        }
-        else {
-          client.id = client_it->second;
-          client.status = ID_DISCOVERED;
-        }
-      }
-      // Handle port lookups
-      if (port.status != ID_USER_SET && client.status != ID_UNSET) {
-        auto port_it = port_map.find(make_pair(client.id, port.name));
-        if (port_it == port_map.end()) {
-          port.status = ID_UNSET;
-        }
-        else {
-          port.id = port_it->second;
-          port.status = ID_DISCOVERED;
-        }
-      }
-    }
-
-    void update_state() {
-      set_ids(this->addr[SRC_CLIENT], this->addr[SRC_PORT]);
-      set_ids(this->addr[DST_CLIENT], this->addr[DST_PORT]);
-
-      // Some boolean logic: AND statuses together
-      bool s = true;
-      for (int i=0; i<4; ++i) {
-        s = s && (this->addr[i].status != ID_UNSET);
-      }
-      this->all_ids_valid = s;
-
-      if (this->all_ids_valid) {
-        this->is_connected = false;
-        auto range = sub_map.equal_range(make_pair(this->addr[SRC_CLIENT].id, this->addr[SRC_PORT].id));
-        for (auto it = range.first; it != range.second; ++it) {
-          auto connected_dst = it->second;
-          if (connected_dst.first == this->addr[DST_CLIENT].id && connected_dst.second == this->addr[DST_PORT].id) {
-            this->is_connected = true;
-            break;
-          }
-        }
-      }
-    }
-};
 
 snd_seq_t* sequencer_open()
 {
@@ -133,11 +37,11 @@ void sequencer_close(snd_seq_t* sequencer)
 
 // Alsa midi client:port traversal
 // Template from alsamidicable - https://github.com/dgslomin/divs-midi-utilities
-void alsa_build_graph(snd_seq_t *sequencer)
+void alsa_build_graph(snd_seq_t *sequencer, struct alsa_state &alsa_state)
 {
-  client_map.clear();
-  port_map.clear();
-  sub_map.clear();
+  alsa_state.sub_map.clear();
+  alsa_state.sub_map2.clear();
+  alsa_state.names_map.clear();
 
   snd_seq_client_info_t *client_info;
   snd_seq_client_info_t *connected_client_info;
@@ -161,20 +65,19 @@ void alsa_build_graph(snd_seq_t *sequencer)
     snd_seq_port_info_set_client(port_info, client_id);
     snd_seq_port_info_set_port(port_info, -1);
 
-    //Map client name to id
-    client_map[client_name] = client_id;
-
     //Iterate over ports for this client
     while (snd_seq_query_next_port(sequencer, port_info) >= 0)
     {
       const string port_name = string(snd_seq_port_info_get_name(port_info));
       const seq_id port_id = snd_seq_port_info_get_port(port_info);
 
-      //Map port name to id
-      port_map[make_pair(client_id,port_name)] = port_id;
 
       //Map id's to names
-      id_map[make_pair(client_id,port_id)] = make_pair(client_name,port_name);
+      alsa_state.id_map[make_pair(client_id,port_id)] = make_pair(client_name,port_name);
+
+      //Map names
+      alsa_state.names_map.emplace(make_pair(client_name, port_name), make_pair(client_id,port_id));
+
 
       //If we are an input(read)-capable port, check for subscriptions
       if (snd_seq_port_info_get_capability(port_info) & SND_SEQ_PORT_CAP_SUBS_READ)
@@ -191,10 +94,11 @@ void alsa_build_graph(snd_seq_t *sequencer)
           snd_seq_get_any_client_info(sequencer, snd_seq_port_info_get_client(connected_port_info), connected_client_info);
 
           //Map subscription
-          sub_map.emplace(make_pair(
+          alsa_state.sub_map.emplace(make_pair(
             make_pair(client_id, port_id),
             make_pair(snd_seq_client_info_get_client(connected_client_info), snd_seq_port_info_get_port(connected_port_info))
           ));
+          alsa_state.sub_map2[make_pair(client_id, port_id)].insert(make_pair(snd_seq_client_info_get_client(connected_client_info), snd_seq_port_info_get_port(connected_port_info)));
 
           snd_seq_query_subscribe_set_index(subscriptions, snd_seq_query_subscribe_get_index(subscriptions) + 1);
         }
@@ -210,7 +114,7 @@ void alsa_build_graph(snd_seq_t *sequencer)
 }
 
 // Connect sender client:port to dest client:port
-bool alsa_connect(snd_seq_t* sequencer, const pair<seq_id,seq_id> &sender, const pair<seq_id,seq_id> &dest)
+bool alsa_connect(snd_seq_t* sequencer, const midi_id &sender, const midi_id &dest)
 {
   snd_seq_addr_t from = { sender.first, sender.second };
   snd_seq_addr_t to = { dest.first, dest.second };
@@ -238,21 +142,37 @@ bool alsa_connect(snd_seq_t* sequencer, const pair<seq_id,seq_id> &sender, const
 
 
 
+
+bool is_connected(const midi_id &src, const midi_id &dst)
+{
+  auto find = alsa_state.sub_map2.find(src);
+  if (find != alsa_state.sub_map2.end()) {
+    if (find->second.count(dst) >= 1)
+      return true;
+  }
+  return false;
+}
+
 void run_connections(snd_seq_t* sequencer)
 {
-  for (auto &c : conn_configs) {
-    c.update_state();
-    if (c.is_connected) continue;
+  for (auto &config : conn_configs) {
+    config.update_state(alsa_state);
 
-    if (alsa_connect(sequencer, make_pair(c.src_client.id,c.src_port.id), make_pair(c.dst_client.id,c.dst_port.id))) {
-      printf("Connected %s:%s (%d:%d) to %s:%s (%d:%d)\n", 
-        c.src_client.name.c_str(), c.src_port.name.c_str(), c.src_client.id, c.src_port.id,
-        c.dst_client.name.c_str(), c.dst_port.name.c_str(), c.dst_client.id, c.dst_port.id);
+    for (auto &c : config.id_connections) {
+      if (is_connected(c.first,c.second)) continue;
+
+      if (alsa_connect(sequencer, c.first, c.second)) {
+        printf("Connected %s:%s (%d:%d) to %s:%s (%d:%d)\n", 
+          alsa_state.id_map[c.first].first.c_str(), alsa_state.id_map[c.first].second.c_str(), c.first.first, c.first.second,
+          alsa_state.id_map[c.second].first.c_str(), alsa_state.id_map[c.second].second.c_str(), c.second.first, c.second.second);
+      }
+      else //Connection failed
+        fprintf(stderr, "Unabled to connect %s:%s (%d:%d) to %s:%s (%d:%d)\n",
+          alsa_state.id_map[c.first].first.c_str(), alsa_state.id_map[c.first].second.c_str(), c.first.first, c.first.second,
+          alsa_state.id_map[c.second].first.c_str(), alsa_state.id_map[c.second].second.c_str(), c.second.first, c.second.second);
     }
   }
 }
-
-
 
 
 
@@ -312,17 +232,17 @@ void parse_config(ifstream &infile)
 
 void dump() {
   auto seq = sequencer_open();
-  alsa_build_graph(seq);
+  alsa_build_graph(seq, alsa_state);
   sequencer_close(seq);
 
-  cerr << sub_map.size() << " connections:" << endl;
+  cerr << alsa_state.sub_map.size() << " connections:" << endl;
 
-  for (auto const &c : sub_map) {
+  for (auto const &c : alsa_state.sub_map) {
     auto src = c.first;
     auto dst = c.second;
 
-    printf("%s:%s",    id_map.at(src).first.c_str(), id_map.at(src).second.c_str());
-    printf(":%s:%s\n", id_map.at(dst).first.c_str(), id_map.at(dst).second.c_str());
+    printf("%s:%s",    alsa_state.id_map.at(src).first.c_str(), alsa_state.id_map.at(src).second.c_str());
+    printf(":%s:%s\n", alsa_state.id_map.at(dst).first.c_str(), alsa_state.id_map.at(dst).second.c_str());
   }
 
   exit(0);
@@ -379,7 +299,7 @@ int main(int argc, char **argv)
 
   auto seq = sequencer_open();
 
-  alsa_build_graph(seq);
+  alsa_build_graph(seq, alsa_state);
   run_connections(seq);
 
   if (runonce) {
@@ -423,7 +343,7 @@ int main(int argc, char **argv)
         cout << "Alsa midi layout change detected.  Refreshing connections." << endl;
         sleep(1);
         snd_seq_drop_input(seq);
-        alsa_build_graph(seq);
+        alsa_build_graph(seq, alsa_state);
         run_connections(seq);
         break;
 
